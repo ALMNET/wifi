@@ -15,531 +15,576 @@
  * limitations under the License.
  */
 
-#include "mgos_wifi.h"
-#include "mgos_wifi_hal.h"
+bool high = 1;
+bool low  = 0;
+
+#define WIFI_UP_LED				26
+#define WIFI_DOWN_LED			27
+
+#include "esp32_wifi.h"
+#include "mgos_gpio.h"
 
 #include <stdbool.h>
-#include <stdlib.h>
+#include <string.h>
+
+#include "esp_wifi.h"
+#include "esp_wpa2.h"
+#include "tcpip_adapter.h"
+#include "dhcpserver/dhcpserver.h"
+#include "lwip/ip_addr.h"
 
 #include "common/cs_dbg.h"
+#include "common/cs_file.h"
 #include "common/queue.h"
 
-#include "mgos_gpio.h"
-#include "mgos_mongoose.h"
+#include "mgos_hal.h"
 #include "mgos_net_hal.h"
 #include "mgos_sys_config.h"
-#include "mgos_system.h"
-#include "mgos_timers.h"
+#include "mgos_wifi_hal.h"
 
-#include "mongoose.h"
+static bool s_inited = false;
+static bool s_started = false;
+typedef esp_err_t (*wifi_func_t)(void *arg);
 
-#define NUM_STA_CFG 3
-
-struct cb_info {
-  void *cb;
-  void *arg;
-  SLIST_ENTRY(cb_info) next;
-};
-static SLIST_HEAD(s_scan_cbs, cb_info) s_scan_cbs;
-static bool s_scan_in_progress = false;
-
-enum mgos_wifi_status s_sta_status = MGOS_WIFI_DISCONNECTED;
-static char *s_sta_ssid = NULL;
-static bool s_sta_should_reconnect = false;
-
-struct mgos_rlock_type *s_wifi_lock = NULL;
-
-static int s_cur_sta_cfg_idx = -1;
-static struct mgos_config_wifi *s_cur_cfg = NULL;
-static mgos_timer_id s_connect_timer_id = MGOS_INVALID_TIMER_ID;
-
-static inline void wifi_lock(void) {
-  mgos_rlock(s_wifi_lock);
-}
-
-static inline void wifi_unlock(void) {
-  mgos_runlock(s_wifi_lock);
-}
-
-static const struct mgos_config_wifi_sta *mgos_wifi_get_sta_cfg(
-    const struct mgos_config_wifi *cfg, int idx) {
-  if (cfg == NULL) return NULL;
-  switch (idx) {
-    case 0:
-      return &cfg->sta;
-    case 1:
-      return &cfg->sta1;
-    case 2:
-      return &cfg->sta2;
-  }
-  return NULL;
-}
-
-static int mgos_wifi_get_next_sta_cfg_idx(const struct mgos_config_wifi *cfg,
-                                          int start) {
-  if (cfg == NULL) return -1;
-  int idx = start;
-  char *msg = NULL;
-  do {
-    const struct mgos_config_wifi_sta *sta_cfg =
-        mgos_wifi_get_sta_cfg(cfg, idx);
-    if (sta_cfg && sta_cfg->enable) {
-      if (mgos_wifi_validate_sta_cfg(sta_cfg, &msg)) {
-        LOG(LL_INFO, ("WiFi STA: Using config %d (%s)", idx, sta_cfg->ssid));
-        return idx;
-      } else {
-        free(msg);
-        msg = NULL;
-      }
-    }
-    idx = (idx + 1) % NUM_STA_CFG;
-  } while (idx != start);
-  return -1;
-}
-
-static void mgos_wifi_sta_connect_timeout_timer_cb(void *arg);
-
-static void mgos_wifi_event_cb(void *arg) {
-  bool reconnect = false, net_event = true;
-  struct mgos_wifi_dev_event_info *dei =
-      (struct mgos_wifi_dev_event_info *) arg;
-  void *ev_arg = NULL;
-  enum mgos_net_event nev = MGOS_NET_EV_DISCONNECTED;
-  switch (dei->ev) {
-    case MGOS_WIFI_EV_STA_DISCONNECTED: {
-      if ((s_sta_status == MGOS_WIFI_CONNECTED ||
-           s_sta_status == MGOS_WIFI_IP_ACQUIRED) &&
-          s_sta_should_reconnect) {
-        reconnect = s_sta_should_reconnect;
-      }
-      ev_arg = &dei->sta_disconnected;
-      s_sta_status = MGOS_WIFI_DISCONNECTED;
-      nev = MGOS_NET_EV_DISCONNECTED;
-      LOG(LL_INFO,
-          ("WiFi STA: Disconnected, reason: %d", dei->sta_disconnected.reason));
+esp_err_t esp32_wifi_ev(system_event_t *ev) {
+  struct mgos_wifi_dev_event_info dei = {0};
+  system_event_info_t *info = &ev->event_info;
+  switch (ev->event_id) {
+    case SYSTEM_EVENT_STA_START: {
       break;
     }
-    case MGOS_WIFI_EV_STA_CONNECTING: {
-      s_sta_status = MGOS_WIFI_CONNECTING;
-      nev = MGOS_NET_EV_CONNECTING;
+    case SYSTEM_EVENT_STA_STOP:
+      mgos_wifi_dev_scan_cb(-2, NULL);
+      break;
+    case SYSTEM_EVENT_STA_DISCONNECTED:
+      dei.ev = MGOS_WIFI_EV_STA_DISCONNECTED;
+      dei.sta_disconnected.reason = info->disconnected.reason;
+      break;
+    case SYSTEM_EVENT_STA_CONNECTED:
+      dei.ev = MGOS_WIFI_EV_STA_CONNECTED;
+      memcpy(dei.sta_connected.bssid, info->connected.bssid, 6);
+      dei.sta_connected.channel = info->connected.channel;
+      break;
+    case SYSTEM_EVENT_STA_GOT_IP:
+      dei.ev = MGOS_WIFI_EV_STA_IP_ACQUIRED;
+      break;
+    case SYSTEM_EVENT_AP_STACONNECTED: {
+      dei.ev = MGOS_WIFI_EV_AP_STA_CONNECTED;
+      memcpy(dei.ap_sta_connected.mac, ev->event_info.sta_connected.mac,
+             sizeof(dei.ap_sta_connected.mac));
       break;
     }
-    case MGOS_WIFI_EV_STA_CONNECTED: {
-      ev_arg = &dei->sta_connected;
-      s_sta_status = MGOS_WIFI_CONNECTED;
-      nev = MGOS_NET_EV_CONNECTED;
-      struct mgos_wifi_sta_connected_arg *ea = &dei->sta_connected;
-      ea->rssi = mgos_wifi_sta_get_rssi();
-      LOG(LL_INFO, ("WiFi STA: Connected, BSSID %02x:%02x:%02x:%02x:%02x:%02x "
-                    "ch %d RSSI %d",
-                    ea->bssid[0], ea->bssid[1], ea->bssid[2], ea->bssid[3],
-                    ea->bssid[4], ea->bssid[5], ea->channel, ea->rssi));
+    case SYSTEM_EVENT_AP_STADISCONNECTED: {
+      memcpy(dei.ap_sta_disconnected.mac, ev->event_info.sta_disconnected.mac,
+             sizeof(dei.ap_sta_disconnected.mac));
+      dei.ev = MGOS_WIFI_EV_AP_STA_DISCONNECTED;
       break;
     }
-    case MGOS_WIFI_EV_STA_IP_ACQUIRED: {
-      s_sta_status = MGOS_WIFI_IP_ACQUIRED;
-      mgos_clear_timer(s_connect_timer_id);
-      s_connect_timer_id = MGOS_INVALID_TIMER_ID;
-      if (s_cur_cfg && s_cur_cfg->sta_cfg_idx != s_cur_sta_cfg_idx) {
-        LOG(LL_INFO, ("WiFi STA: New current config: %d", s_cur_sta_cfg_idx));
-        s_cur_cfg->sta_cfg_idx = s_cur_sta_cfg_idx;
-        if (s_cur_cfg == mgos_sys_config_get_wifi()) {
-          save_cfg(&mgos_sys_config, NULL);
+    case SYSTEM_EVENT_SCAN_DONE: {
+      int num_res = -1;
+      struct mgos_wifi_scan_result *res = NULL;
+      system_event_sta_scan_done_t *p = &ev->event_info.scan_done;
+      if (p->status == 0) {
+        uint16_t number = p->number;
+        wifi_ap_record_t *aps =
+            (wifi_ap_record_t *) calloc(number, sizeof(*aps));
+        if (esp_wifi_scan_get_ap_records(&number, aps) == ESP_OK) {
+          res = (struct mgos_wifi_scan_result *) calloc(number, sizeof(*res));
+          struct mgos_wifi_scan_result *r;
+          wifi_ap_record_t *ap;
+          for (ap = aps, r = res, num_res = 0; num_res < number;
+               ap++, r++, num_res++) {
+            strncpy(r->ssid, (const char *) ap->ssid, sizeof(r->ssid));
+            memcpy(r->bssid, ap->bssid, sizeof(r->bssid));
+            r->ssid[sizeof(r->ssid) - 1] = '\0';
+            r->auth_mode = (enum mgos_wifi_auth_mode) ap->authmode;
+            r->channel = ap->primary;
+            r->rssi = ap->rssi;
+          }
+        } else {
+          num_res = -2;
         }
+        free(aps);
       }
-      nev = MGOS_NET_EV_IP_ACQUIRED;
+      mgos_wifi_dev_scan_cb(num_res, res);
       break;
     }
-    case MGOS_WIFI_EV_AP_STA_CONNECTED:
-    case MGOS_WIFI_EV_AP_STA_DISCONNECTED: {
-      struct mgos_wifi_ap_sta_connected_arg *ea = &dei->ap_sta_connected;
-      LOG(LL_INFO,
-          ("%02x:%02x:%02x:%02x:%02x:%02x %s", ea->mac[0], ea->mac[1],
-           ea->mac[2], ea->mac[3], ea->mac[4], ea->mac[5],
-           (dei->ev == MGOS_WIFI_EV_AP_STA_CONNECTED ? "connected"
-                                                     : "disconnected")));
-      net_event = false;
-      ev_arg = &dei->ap_sta_connected;
-      (void) ea;
+    default:
       break;
-    }
   }
 
-  mgos_event_trigger(dei->ev, ev_arg);
-
-  if (net_event) {
-    mgos_net_dev_event_cb(MGOS_NET_IF_TYPE_WIFI, MGOS_NET_IF_WIFI_STA, nev);
-  }
-
-  free(dei);
-
-  if (reconnect && s_sta_should_reconnect) {
-    mgos_wifi_connect();
-  }
-}
-
-void mgos_wifi_dev_event_cb(const struct mgos_wifi_dev_event_info *dei) {
-  struct mgos_wifi_dev_event_info *deic =
-      (struct mgos_wifi_dev_event_info *) calloc(1, sizeof(*deic));
-  if (deic == NULL) return;
-  memcpy(deic, dei, sizeof(*deic));
-  mgos_invoke_cb(mgos_wifi_event_cb, deic, false /* from_isr */);
-}
-
-bool mgos_wifi_validate_sta_cfg(const struct mgos_config_wifi_sta *cfg,
-                                char **msg) {
-  if (!cfg->enable) return true;
-  if (mgos_conf_str_empty(cfg->ssid) || strlen(cfg->ssid) > 31) {
-    if (!mg_asprintf(msg, 0, "%s %s must be between %d and %d chars", "STA",
-                     "SSID", 1, 31)) {
-    }
-    return false;
-  }
-  /* Note: WEP allows 5 char passwords. */
-  if (!mgos_conf_str_empty(cfg->pass) &&
-      (strlen(cfg->pass) < 5 || strlen(cfg->pass) > 63)) {
-    if (!mg_asprintf(msg, 0, "%s %s must be between %d and %d chars", "STA",
-                     "password", 8, 63)) {
-    }
-    return false;
-  }
-  if (!mgos_conf_str_empty(cfg->ip)) {
-    if (mgos_conf_str_empty(cfg->netmask)) {
-      if (!mg_asprintf(msg, 0,
-                       "Station static IP is set but no netmask provided")) {
-      }
-      return false;
-    }
-    /* TODO(rojer): More validation here: IP & gw within the same net. */
-  }
-  return true;
-}
-
-bool mgos_wifi_validate_ap_cfg(const struct mgos_config_wifi_ap *cfg,
-                               char **msg) {
-  if (!cfg->enable) return true;
-  if (mgos_conf_str_empty(cfg->ssid) || strlen(cfg->ssid) > 31) {
-    if (!mg_asprintf(msg, 0, "%s %s must be between %d and %d chars", "AP",
-                     "SSID", 1, 31)) {
-    }
-    return false;
-  }
-  if (!mgos_conf_str_empty(cfg->pass) &&
-      (strlen(cfg->pass) < 8 || strlen(cfg->pass) > 63)) {
-    if (!mg_asprintf(msg, 0, "%s %s must be between %d and %d chars", "AP",
-                     "password", 8, 63)) {
-    }
-    return false;
-  }
-  if (mgos_conf_str_empty(cfg->ip) || mgos_conf_str_empty(cfg->netmask) ||
-      mgos_conf_str_empty(cfg->dhcp_start) ||
-      mgos_conf_str_empty(cfg->dhcp_end)) {
-    *msg = strdup("AP IP, netmask, DHCP start and end addresses must be set");
-    return false;
-  }
-  /* TODO(rojer): More validation here. DHCP range, netmask, GW (if set). */
-  return true;
-}
-
-static bool validate_wifi_cfg(const struct mgos_config *cfg, char **msg) {
-  return (mgos_wifi_validate_ap_cfg(&cfg->wifi.ap, msg) &&
-          mgos_wifi_validate_sta_cfg(&cfg->wifi.sta, msg));
-}
-
-static void set_reconnect_timer(void) {
-  if (s_cur_cfg == NULL || s_cur_sta_cfg_idx < 0 ||
-      s_cur_cfg->sta_connect_timeout <= 0 ||
-      s_connect_timer_id != MGOS_INVALID_TIMER_ID) {
-    return;
-  }
-  s_connect_timer_id =
-      mgos_set_timer(s_cur_cfg->sta_connect_timeout * 1000, 0,
-                     mgos_wifi_sta_connect_timeout_timer_cb, NULL);
-}
-
-bool mgos_wifi_setup_sta(const struct mgos_config_wifi_sta *cfg) {
-  char *err_msg = NULL;
-  if (!mgos_wifi_validate_sta_cfg(cfg, &err_msg)) {
-    LOG(LL_ERROR, ("WiFi STA: %s", err_msg));
-    free(err_msg);
-    return false;
-  }
-  wifi_lock();
-  bool ret = mgos_wifi_dev_sta_setup(cfg);
-  if (ret && cfg->enable) {
-    LOG(LL_INFO, ("WiFi STA: Connecting to %s", cfg->ssid));
-    free(s_sta_ssid);
-    s_sta_ssid = strdup(cfg->ssid);
-    ret = mgos_wifi_connect();
-  } else {
-    set_reconnect_timer();
-  }
-  if (ret) s_cur_cfg = NULL;
-  wifi_unlock();
-  return ret;
-}
-
-static void wifi_ap_disable_timer_cb(void *arg) {
-  if (!mgos_sys_config_get_wifi_ap_enable()) return;
-  LOG(LL_INFO, ("Disabling AP"));
-  mgos_sys_config_set_wifi_ap_enable(false);
-  save_cfg(&mgos_sys_config, NULL);
-  mgos_wifi_setup_ap(&mgos_sys_config.wifi.ap);
-  (void) arg;
-}
-
-bool mgos_wifi_setup_ap(const struct mgos_config_wifi_ap *cfg) {
-  char *err_msg = NULL;
-  if (!mgos_wifi_validate_ap_cfg(cfg, &err_msg)) {
-    LOG(LL_ERROR, ("WiFi AP: %s", err_msg));
-    free(err_msg);
-    return false;
-  }
-  wifi_lock();
-  bool ret = mgos_wifi_dev_ap_setup(cfg);
-  wifi_unlock();
-  if (cfg->enable && ret && cfg->disable_after > 0) {
-    LOG(LL_INFO, ("WiFi AP: Enabled for %d seconds", cfg->disable_after));
-    mgos_set_timer(cfg->disable_after * 1000, 0, wifi_ap_disable_timer_cb,
-                   NULL);
-  }
-  return ret;
-}
-
-bool mgos_wifi_connect(void) {
-  wifi_lock();
-  s_sta_should_reconnect = true;
-  bool ret = mgos_wifi_dev_sta_connect();
-  if (ret) {
-    struct mgos_wifi_dev_event_info dei = {
-        .ev = MGOS_WIFI_EV_STA_CONNECTING,
-    };
+  if (dei.ev != 0) {
     mgos_wifi_dev_event_cb(&dei);
   }
-  set_reconnect_timer();
-  wifi_unlock();
-  return ret;
+
+  return ESP_OK;
 }
 
-bool mgos_wifi_disconnect(void) {
-  if (s_cur_sta_cfg_idx < 0) return false;  // Not inited.
-  wifi_lock();
-  s_sta_should_reconnect = false;
-  bool ret = true;
-  if (s_sta_status != MGOS_WIFI_DISCONNECTED) {
-    ret = mgos_wifi_dev_sta_disconnect();
-  }
-  if (ret) {
-    mgos_clear_timer(s_connect_timer_id);
-    s_connect_timer_id = MGOS_INVALID_TIMER_ID;
-  }
-  wifi_unlock();
-  return ret;
-}
-
-static void mgos_wifi_sta_connect_timeout_timer_cb(void *arg) {
-  wifi_lock();
-  int new_idx = -1;
-  struct mgos_config_wifi *cfg = s_cur_cfg;
-  s_connect_timer_id = MGOS_INVALID_TIMER_ID;
-  LOG(LL_ERROR, ("WiFi STA: Connect timeout"));
-  if (cfg == NULL) goto out;
-  new_idx = mgos_wifi_get_next_sta_cfg_idx(
-      cfg, (s_cur_sta_cfg_idx + 1) % NUM_STA_CFG);
-  /* Note: even if the config didn't change, disconnect and
-   * reconnect to re-init WiFi. */
-  mgos_wifi_disconnect();
-  mgos_wifi_setup_sta(mgos_wifi_get_sta_cfg(cfg, new_idx));
-  s_cur_cfg = cfg;
-  s_cur_sta_cfg_idx = new_idx;
-out:
-  wifi_unlock();
-  (void) arg;
-}
-
-enum mgos_wifi_status mgos_wifi_get_status(void) {
-  return s_sta_status;
-}
-
-char *mgos_wifi_get_status_str(void) {
-  const char *s = NULL;
-  enum mgos_wifi_status st = mgos_wifi_get_status();
-  switch (st) {
-    case MGOS_WIFI_DISCONNECTED:
-      s = "disconnected";
-      break;
-    case MGOS_WIFI_CONNECTING:
-      s = "connecting";
-      break;
-    case MGOS_WIFI_CONNECTED:
-      s = "connected";
-      break;
-    case MGOS_WIFI_IP_ACQUIRED:
-      s = "got ip";
-      break;
-  }
-  return (s != NULL ? strdup(s) : NULL);
-}
-
-struct scan_result_info {
-  int num_res;
-  struct mgos_wifi_scan_result *res;
-};
-
-static void scan_cb_cb(void *arg) {
-  struct scan_result_info *ri = (struct scan_result_info *) arg;
-  wifi_lock();
-  SLIST_HEAD(scan_cbs, cb_info) scan_cbs;
-  memcpy(&scan_cbs, &s_scan_cbs, sizeof(scan_cbs));
-  memset(&s_scan_cbs, 0, sizeof(s_scan_cbs));
-  wifi_unlock();
-  struct cb_info *cbi, *cbit;
-  SLIST_FOREACH_SAFE(cbi, &scan_cbs, next, cbit) {
-    ((mgos_wifi_scan_cb_t) cbi->cb)(ri->num_res, ri->res, cbi->arg);
-    free(cbi);
-  }
-  free(ri->res);
-  free(ri);
-}
-
-void mgos_wifi_dev_scan_cb(int num_res, struct mgos_wifi_scan_result *res) {
-  if (!s_scan_in_progress) return;
-  LOG(LL_DEBUG, ("WiFi scan done, num_res %d", num_res));
-  struct scan_result_info *ri =
-      (struct scan_result_info *) calloc(1, sizeof(*ri));
-  ri->num_res = num_res;
-  ri->res = res;
-  s_scan_in_progress = false;
-  mgos_invoke_cb(scan_cb_cb, ri, false /* from_isr */);
-}
-
-void mgos_wifi_scan(mgos_wifi_scan_cb_t cb, void *arg) {
-  struct cb_info *cbi = (struct cb_info *) calloc(1, sizeof(*cbi));
-  if (cbi == NULL) return;
-  cbi->cb = cb;
-  cbi->arg = arg;
-  wifi_lock();
-  SLIST_INSERT_HEAD(&s_scan_cbs, cbi, next);
-  if (!s_scan_in_progress) {
-    s_scan_in_progress = true;
-    if (!mgos_wifi_dev_start_scan()) {
-      mgos_wifi_dev_scan_cb(-1, NULL);
+static wifi_mode_t esp32_wifi_get_mode(void) {
+  wifi_mode_t cur_mode = WIFI_MODE_NULL;
+  if (s_inited) {
+    if (esp_wifi_get_mode(&cur_mode) != ESP_OK) {
+      cur_mode = WIFI_MODE_NULL;
     }
   }
-  wifi_unlock();
+  return cur_mode;
 }
 
-char *mgos_wifi_get_connected_ssid(void) {
-  return (s_sta_status == MGOS_WIFI_IP_ACQUIRED ? strdup(s_sta_ssid) : NULL);
+static esp_err_t esp32_wifi_ensure_init(void) {
+  esp_err_t r = ESP_OK;
+  if (!s_inited) {
+    wifi_init_config_t icfg = WIFI_INIT_CONFIG_DEFAULT();
+    r = esp_wifi_init(&icfg);
+    if (r != ESP_OK) {
+      LOG(LL_ERROR, ("Failed to init WiFi: %d", r));
+      goto out;
+    }
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    s_inited = true;
+  }
+out:
+  return r;
 }
 
-bool mgos_wifi_setup(struct mgos_config_wifi *cfg) {
-  bool result = false, trigger_ap = false;
-  int gpio = cfg->ap.trigger_on_gpio;
+static esp_err_t esp32_wifi_ensure_start(void) {
+  esp_err_t r = ESP_OK;
+  if (!s_started) {
+    r = esp_wifi_start();
+    if (r != ESP_OK) {
+      LOG(LL_ERROR, ("Failed to start WiFi: %d", r));
+      goto out;
+    }
+    s_started = true;
+    wifi_ps_type_t ps_type = WIFI_PS_NONE;
+    esp_wifi_get_ps(&ps_type);
+    /* Workaround for https://github.com/espressif/esp-idf/issues/1942 */
+    if (ps_type != WIFI_PS_NONE) esp_wifi_set_ps(WIFI_PS_NONE);
+  }
+out:
+  return r;
+}
 
-  if (gpio >= 0) {
-    mgos_gpio_set_mode(gpio, MGOS_GPIO_MODE_INPUT);
-    mgos_gpio_set_pull(gpio, MGOS_GPIO_PULL_UP);
-    trigger_ap = (mgos_gpio_read(gpio) == 0);
+static esp_err_t esp32_wifi_set_mode(wifi_mode_t mode) {
+  esp_err_t r;
+
+  const char *mode_str = NULL;
+  switch (mode) {
+    case WIFI_MODE_NULL:
+      mode_str = "disabled";
+      break;
+    case WIFI_MODE_AP:
+      mode_str = "AP";
+      break;
+    case WIFI_MODE_STA:
+      mode_str = "STA";
+      break;
+    case WIFI_MODE_APSTA:
+      mode_str = "AP+STA";
+      break;
+    default:
+      mode_str = "???";
+  }
+  LOG(LL_INFO, ("WiFi mode: %s", mode_str));
+
+  if (mode == WIFI_MODE_NULL) {
+    if (s_started) {
+      esp_wifi_set_mode(WIFI_MODE_NULL);
+    }
+    r = esp_wifi_stop();
+    if (r == ESP_ERR_WIFI_NOT_INIT) r = ESP_OK; /* Nothing to stop. */
+    if (r == ESP_OK) {
+      s_started = false;
+    }
+    goto out;
   }
 
-  const struct mgos_config_wifi_ap dummy_ap_cfg = {.enable = false};
-  const struct mgos_config_wifi_sta dummy_sta_cfg = {.enable = false};
+  r = esp32_wifi_ensure_init();
 
-  int sta_cfg_idx = mgos_wifi_get_next_sta_cfg_idx(cfg, cfg->sta_cfg_idx);
-  const struct mgos_config_wifi_sta *sta_cfg =
-      mgos_wifi_get_sta_cfg(cfg, sta_cfg_idx);
+  if (r != ESP_OK) goto out;
 
-  if (trigger_ap || (cfg->ap.enable && sta_cfg == NULL)) {
-    struct mgos_config_wifi_ap ap_cfg;
-    memcpy(&ap_cfg, &cfg->ap, sizeof(ap_cfg));
-    ap_cfg.enable = true;
-    LOG(LL_INFO, ("WiFi mode: %s", "AP"));
-    /* Disable STA if it was enabled. */
-    mgos_wifi_setup_sta(&dummy_sta_cfg);
-    result = mgos_wifi_setup_ap(&ap_cfg);
-#ifdef MGOS_WIFI_ENABLE_AP_STA /* ifdef-ok */
-  } else if (cfg->ap.enable && sta_cfg != NULL && cfg->ap.keep_enabled) {
-    LOG(LL_INFO, ("WiFi mode: %s", "AP+STA"));
-    result = (mgos_wifi_setup_ap(&cfg->ap) && mgos_wifi_setup_sta(sta_cfg));
-#endif
-  } else if (sta_cfg != NULL) {
-    LOG(LL_INFO, ("WiFi mode: %s", "STA"));
-    /* Disable AP if it was enabled. */
-    mgos_wifi_setup_ap(&dummy_ap_cfg);
-    result = mgos_wifi_setup_sta(sta_cfg);
+  if (s_started) {
+    if (esp_wifi_stop() == ESP_OK) {
+      s_started = false;
+    }
+  }
+
+  if ((r = esp_wifi_set_mode(mode)) != ESP_OK) {
+    LOG(LL_ERROR, ("Failed to set WiFi mode %d: %d", mode, r));
+    goto out;
+  }
+
+  if ((r = esp32_wifi_ensure_start()) != ESP_OK) {
+    goto out;
+  }
+
+out:
+  return r;
+}
+
+static esp_err_t mgos_wifi_add_mode(wifi_mode_t mode) {
+  esp_err_t r = ESP_OK;
+  wifi_mode_t cur_mode = esp32_wifi_get_mode();
+  LOG(LL_INFO, ("cur mode: %d", cur_mode));
+  if (cur_mode == mode || cur_mode == WIFI_MODE_APSTA) {
+    goto out;
+  }
+
+  if ((cur_mode == WIFI_MODE_AP && mode == WIFI_MODE_STA) ||
+      (cur_mode == WIFI_MODE_STA && mode == WIFI_MODE_AP)) {
+    mode = WIFI_MODE_APSTA;
+  }
+
+  r = esp32_wifi_set_mode(mode);
+
+out:
+  return r;
+}
+
+static esp_err_t mgos_wifi_remove_mode(wifi_mode_t mode) {
+  esp_err_t r = ESP_OK;
+
+  wifi_mode_t cur_mode = esp32_wifi_get_mode();
+  if (cur_mode == WIFI_MODE_NULL ||
+      (mode == WIFI_MODE_STA && cur_mode == WIFI_MODE_AP) ||
+      (mode == WIFI_MODE_AP && cur_mode == WIFI_MODE_STA)) {
+    /* Nothing to do. */
+    goto out;
+  }
+  if (mode == WIFI_MODE_APSTA ||
+      (mode == WIFI_MODE_STA && cur_mode == WIFI_MODE_STA) ||
+      (mode == WIFI_MODE_AP && cur_mode == WIFI_MODE_AP)) {
+    mode = WIFI_MODE_NULL;
+  } else if (mode == WIFI_MODE_STA) {
+    mode = WIFI_MODE_AP;
   } else {
-    LOG(LL_INFO, ("WiFi mode: %s", "off"));
-    mgos_wifi_setup_sta(&dummy_sta_cfg);
-    mgos_wifi_setup_ap(&dummy_ap_cfg);
-    result = true;
+    mode = WIFI_MODE_STA;
+  }
+  /* As a result we will always remain in STA-only or AP-only mode. */
+  r = esp32_wifi_set_mode(mode);
+
+out:
+  return r;
+}
+
+static esp_err_t wifi_sta_set_host_name(
+    const struct mgos_config_wifi_sta *cfg) {
+  esp_err_t r = ESP_OK;
+  const char *host_name =
+      cfg->dhcp_hostname ? cfg->dhcp_hostname : mgos_sys_config_get_device_id();
+  if (host_name != NULL) {
+    r = tcpip_adapter_set_hostname(TCPIP_ADAPTER_IF_STA, host_name);
+  }
+  return r;
+}
+
+bool mgos_wifi_dev_sta_setup(const struct mgos_config_wifi_sta *cfg) {
+  bool result = false;
+  esp_err_t r;
+  wifi_config_t wcfg;
+  memset(&wcfg, 0, sizeof(wcfg));
+  wifi_sta_config_t *stacfg = &wcfg.sta;
+
+  if (!cfg->enable) {
+    result = (mgos_wifi_remove_mode(WIFI_MODE_STA) == ESP_OK);
+    goto out;
   }
 
-  s_cur_cfg = cfg;
-  s_cur_sta_cfg_idx = sta_cfg_idx;
-  mgos_clear_timer(s_connect_timer_id);
-  s_connect_timer_id = MGOS_INVALID_TIMER_ID;
-  set_reconnect_timer();
+  r = mgos_wifi_add_mode(WIFI_MODE_STA);
+  if (r != ESP_OK) goto out;
 
+  /* In case already connected, disconnect. */
+  esp_wifi_disconnect();
+
+  strncpy((char *) stacfg->ssid, cfg->ssid, sizeof(stacfg->ssid));
+  if (mgos_conf_str_empty(cfg->user) /* Not using EAP */ &&
+      !mgos_conf_str_empty(cfg->pass)) {
+    strncpy((char *) stacfg->password, cfg->pass, sizeof(stacfg->password));
+  }
+
+  if (!mgos_conf_str_empty(cfg->ip) && !mgos_conf_str_empty(cfg->netmask)) {
+    tcpip_adapter_dhcpc_stop(TCPIP_ADAPTER_IF_STA);
+    tcpip_adapter_ip_info_t info;
+    memset(&info, 0, sizeof(info));
+    info.ip.addr = ipaddr_addr(cfg->ip);
+    info.netmask.addr = ipaddr_addr(cfg->netmask);
+    if (!mgos_conf_str_empty(cfg->gw)) info.gw.addr = ipaddr_addr(cfg->gw);
+    r = tcpip_adapter_set_ip_info(TCPIP_ADAPTER_IF_STA, &info);
+    if (r != ESP_OK) {
+      LOG(LL_ERROR, ("Failed to set WiFi STA IP config: %d", r));
+      goto out;
+    }
+    LOG(LL_INFO, ("WiFi STA IP: %s/%s gw %s", cfg->ip, cfg->netmask,
+                  (cfg->gw ? cfg->gw : "")));
+  } else {
+    tcpip_adapter_dhcpc_start(TCPIP_ADAPTER_IF_STA);
+  }
+
+  r = esp_wifi_set_config(WIFI_IF_STA, &wcfg);
+  if (r != ESP_OK) {
+    LOG(LL_ERROR, ("Failed to set STA config: %d", r));
+    goto out;
+  }
+
+  if (!mgos_conf_str_empty(cfg->cert) || !mgos_conf_str_empty(cfg->user)) {
+    /* WPA-enterprise mode */
+    static char *s_ca_cert_pem = NULL, *s_cert_pem = NULL, *s_key_pem = NULL;
+    const char *user = cfg->user;
+
+    if (user == NULL) user = "";
+
+    esp_wifi_sta_wpa2_ent_set_username((unsigned char *) user, strlen(user));
+
+    if (!mgos_conf_str_empty(cfg->anon_identity)) {
+      esp_wifi_sta_wpa2_ent_set_identity((unsigned char *) cfg->anon_identity,
+                                         strlen(cfg->anon_identity));
+    } else {
+      /* By default, username is used. */
+      esp_wifi_sta_wpa2_ent_set_identity((unsigned char *) user, strlen(user));
+    }
+    if (!mgos_conf_str_empty(cfg->pass)) {
+      esp_wifi_sta_wpa2_ent_set_password((unsigned char *) cfg->pass,
+                                         strlen(cfg->pass));
+    } else {
+      esp_wifi_sta_wpa2_ent_clear_password();
+    }
+
+    if (!mgos_conf_str_empty(cfg->ca_cert)) {
+      free(s_ca_cert_pem);
+      size_t len;
+      s_ca_cert_pem = cs_read_file(cfg->ca_cert, &len);
+      if (s_ca_cert_pem == NULL) {
+        LOG(LL_ERROR, ("Failed to read %s", cfg->ca_cert));
+        goto out;
+      }
+      esp_wifi_sta_wpa2_ent_set_ca_cert((unsigned char *) s_ca_cert_pem,
+                                        (int) len);
+    } else {
+      esp_wifi_sta_wpa2_ent_clear_ca_cert();
+    }
+
+    if (!mgos_conf_str_empty(cfg->cert) && !mgos_conf_str_empty(cfg->key)) {
+      free(s_cert_pem);
+      free(s_key_pem);
+      size_t cert_len, key_len;
+      s_cert_pem = cs_read_file(cfg->cert, &cert_len);
+      if (s_cert_pem == NULL) {
+        LOG(LL_ERROR, ("Failed to read %s", cfg->cert));
+        goto out;
+      }
+      s_key_pem = cs_read_file(cfg->key, &key_len);
+      if (s_key_pem == NULL) {
+        LOG(LL_ERROR, ("Failed to read %s", cfg->key));
+        goto out;
+      }
+      esp_wifi_sta_wpa2_ent_set_cert_key(
+          (unsigned char *) s_cert_pem, (int) cert_len,
+          (unsigned char *) s_key_pem, (int) key_len,
+          NULL /* private_key_passwd */, 0 /* private_key_passwd_len */);
+    } else {
+      esp_wifi_sta_wpa2_ent_clear_cert_key();
+    }
+
+    esp_wifi_sta_wpa2_ent_clear_new_password();
+    esp_wifi_sta_wpa2_ent_set_disable_time_check(true /* disable */);
+    esp_wpa2_config_t config = WPA2_CONFIG_INIT_DEFAULT();
+    esp_wifi_sta_wpa2_ent_enable(&config);
+  } else {
+    esp_wifi_sta_wpa2_ent_disable();
+  }
+
+  esp_err_t host_r = wifi_sta_set_host_name(cfg);
+  if (host_r != ESP_OK && host_r != ESP_ERR_TCPIP_ADAPTER_IF_NOT_READY) {
+    LOG(LL_ERROR, ("WiFi STA: Failed to set host name"));
+    goto out;
+  }
+
+  result = true;
+
+out:
   return result;
 }
 
-/*
- * Handler of DNS requests, it resolves mgos_sys_config_get_wifi_ap_hostname()
- * to the IP address of wifi AP (mgos_sys_config_get_wifi_ap_ip()).
- */
-static void dns_ev_handler(struct mg_connection *c, int ev, void *ev_data,
-                           void *user_data) {
-  struct mg_dns_message *msg = (struct mg_dns_message *) ev_data;
-  struct mbuf reply_buf;
-  int i;
+bool mgos_wifi_dev_ap_setup(const struct mgos_config_wifi_ap *cfg) {
+  bool result = false;
+  esp_err_t r;
+  wifi_config_t wcfg;
+  memset(&wcfg, 0, sizeof(wcfg));
+  wifi_ap_config_t *apcfg = &wcfg.ap;
 
-  if (ev != MG_DNS_MESSAGE) return;
+  if (!cfg->enable) {
+    result = (mgos_wifi_remove_mode(WIFI_MODE_AP) == ESP_OK);
+    goto out;
+  }
 
-  mbuf_init(&reply_buf, 512);
-  struct mg_dns_reply reply = mg_dns_create_reply(&reply_buf, msg);
-  for (i = 0; i < msg->num_questions; i++) {
-    char rname[256];
-    struct mg_dns_resource_record *rr = &msg->questions[i];
-    mg_dns_uncompress_name(msg, &rr->name, rname, sizeof(rname) - 1);
-    if (rr->rtype == MG_DNS_A_RECORD &&
-        strcmp(rname, mgos_sys_config_get_wifi_ap_hostname()) == 0) {
-      struct sockaddr_in ip;
-      if (mgos_net_str_to_ip(mgos_sys_config_get_wifi_ap_ip(), &ip)) {
-        mg_dns_reply_record(&reply, rr, NULL, rr->rtype, 10,
-                            &ip.sin_addr.s_addr, 4);
-      }
+  r = mgos_wifi_add_mode(WIFI_MODE_AP);
+  if (r != ESP_OK) goto out;
+
+  strncpy((char *) apcfg->ssid, cfg->ssid, sizeof(apcfg->ssid));
+  mgos_expand_mac_address_placeholders((char *) apcfg->ssid);
+  if (!mgos_conf_str_empty(cfg->pass)) {
+    strncpy((char *) apcfg->password, cfg->pass, sizeof(apcfg->password));
+    apcfg->authmode = WIFI_AUTH_WPA2_PSK;
+  } else {
+    apcfg->authmode = WIFI_AUTH_OPEN;
+  }
+  apcfg->channel = cfg->channel;
+  apcfg->ssid_hidden = (cfg->hidden != 0);
+  apcfg->max_connection = cfg->max_connections;
+  apcfg->beacon_interval = 100; /* ms */
+  LOG(LL_ERROR, ("WiFi AP: SSID %s, channel %d", apcfg->ssid, apcfg->channel));
+
+  tcpip_adapter_dhcps_stop(TCPIP_ADAPTER_IF_AP);
+  {
+    tcpip_adapter_ip_info_t info;
+    memset(&info, 0, sizeof(info));
+    info.ip.addr = ipaddr_addr(cfg->ip);
+    info.netmask.addr = ipaddr_addr(cfg->netmask);
+    if (!mgos_conf_str_empty(cfg->gw)) info.gw.addr = ipaddr_addr(cfg->gw);
+    r = tcpip_adapter_set_ip_info(TCPIP_ADAPTER_IF_AP, &info);
+    if (r != ESP_OK) {
+      LOG(LL_ERROR, ("WiFi AP: Failed to set IP config: %d", r));
+      goto out;
     }
   }
-  mg_dns_send_reply(c, &reply);
-  mbuf_free(&reply_buf);
-  (void) user_data;
+  {
+    dhcps_lease_t opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.enable = true;
+    opt.start_ip.addr = ipaddr_addr(cfg->dhcp_start);
+    opt.end_ip.addr = ipaddr_addr(cfg->dhcp_end);
+    r = tcpip_adapter_dhcps_option(TCPIP_ADAPTER_OP_SET,
+                                   TCPIP_ADAPTER_REQUESTED_IP_ADDRESS, &opt,
+                                   sizeof(opt));
+    if (r != ESP_OK) {
+      LOG(LL_ERROR, ("WiFi AP: Failed to set DHCP config: %d", r));
+      goto out;
+    }
+  }
+  r = esp_wifi_set_config(WIFI_IF_AP, &wcfg);
+  if (r != ESP_OK) {
+    LOG(LL_ERROR, ("WiFi AP: Failed to set config: %d", r));
+    goto out;
+  }
+  r = tcpip_adapter_dhcps_start(TCPIP_ADAPTER_IF_AP);
+  if (r != ESP_OK) {
+    LOG(LL_ERROR, ("WiFi AP: Failed to start DHCP server: %d", r));
+    goto out;
+  }
+  LOG(LL_INFO,
+      ("WiFi AP IP: %s/%s gw %s, DHCP range %s - %s", cfg->ip, cfg->netmask,
+       (cfg->gw ? cfg->gw : "(none)"), cfg->dhcp_start, cfg->dhcp_end));
+
+  /* There is no way to tell if AP is running already. */
+  esp_wifi_start();
+
+  LOG(LL_INFO, ("WiFi AP: SSID %s, channel %d", apcfg->ssid, apcfg->channel));
+
+  result = true;
+
+out:
+  return result;
 }
 
-bool mgos_wifi_init(void) {
-  s_wifi_lock = mgos_rlock_create();
-  mgos_event_register_base(MGOS_WIFI_EV_BASE, "wifi");
-  mgos_sys_config_register_validator(validate_wifi_cfg);
-  mgos_wifi_dev_init();
-  bool ret =
-      mgos_wifi_setup((struct mgos_config_wifi *) mgos_sys_config_get_wifi());
-  if (!ret) {
-    return ret;
+bool mgos_wifi_dev_sta_connect(void) {
+  if (esp32_wifi_ensure_init() != ESP_OK) return false;
+  wifi_mode_t cur_mode = esp32_wifi_get_mode();
+  if (cur_mode == WIFI_MODE_NULL || cur_mode == WIFI_MODE_AP) return false;
+  esp_err_t r = esp_wifi_connect();
+  if (r != ESP_OK) {
+    LOG(LL_ERROR, ("WiFi STA: Connect failed: %d", r));
   }
-
-  /* Setup DNS handler if needed */
-  if (mgos_sys_config_get_wifi_ap_enable() &&
-      mgos_sys_config_get_wifi_ap_hostname() != NULL) {
-    char buf[50];
-    sprintf(buf, "udp://%s:53", mgos_sys_config_get_wifi_ap_ip());
-    struct mg_connection *dns_conn =
-        mg_bind(mgos_get_mgr(), buf, dns_ev_handler, 0);
-    mg_set_protocol_dns(dns_conn);
+  else{
+    mgos_gpio_write(WIFI_UP_LED, high);
+    mgos_gpio_write(WIFI_DOWN_LED, low);
   }
+  
+  return (r == ESP_OK);
+}
 
+bool mgos_wifi_dev_sta_disconnect(void) {
+  wifi_mode_t cur_mode = esp32_wifi_get_mode();
+  if (cur_mode == WIFI_MODE_NULL || cur_mode == WIFI_MODE_AP) return false;
+  esp_wifi_disconnect();
+  /* If we are in station-only mode, stop WiFi task as well. */
+  if (cur_mode == WIFI_MODE_STA) {
+    esp_err_t r = esp_wifi_stop();
+    if (r == ESP_ERR_WIFI_NOT_INIT) r = ESP_OK; /* Nothing to stop. */
+    if (r == ESP_OK) {
+      s_started = false;
+    }
+  }
+  
+  mgos_gpio_write(WIFI_UP_LED, low);
+  mgos_gpio_write(WIFI_DOWN_LED, high);
+  
   return true;
 }
 
-void mgos_wifi_deinit(void) {
-  mgos_wifi_dev_deinit();
+bool mgos_wifi_dev_get_ip_info(int if_instance,
+                               struct mgos_net_ip_info *ip_info) {
+  tcpip_adapter_ip_info_t info;
+  if ((tcpip_adapter_get_ip_info(
+           (if_instance == 0 ? TCPIP_ADAPTER_IF_STA : TCPIP_ADAPTER_IF_AP),
+           &info) != ESP_OK) ||
+      info.ip.addr == 0) {
+    return false;
+  }
+  ip_info->ip.sin_addr.s_addr = info.ip.addr;
+  ip_info->netmask.sin_addr.s_addr = info.netmask.addr;
+  ip_info->gw.sin_addr.s_addr = info.gw.addr;
+  return true;
+}
+
+void mgos_wifi_dev_init(void) {
+}
+
+void mgos_wifi_dev_deinit(void) {
+  if (s_started) {
+    esp_wifi_stop();
+    s_started = false;
+  }
+  if (s_inited) {
+    esp_wifi_deinit();
+    s_inited = false;
+  }
+}
+
+char *mgos_wifi_get_sta_default_dns() {
+  char *dns;
+  ip_addr_t dns_addr = dns_getserver(0);
+  if (dns_addr.u_addr.ip4.addr == 0 || dns_addr.type != IPADDR_TYPE_V4) {
+    return NULL;
+  }
+  if (asprintf(&dns, IPSTR, IP2STR(&dns_addr.u_addr.ip4)) < 0) {
+    return NULL;
+  }
+  return dns;
+}
+
+int mgos_wifi_sta_get_rssi(void) {
+  wifi_ap_record_t info;
+  if (esp_wifi_sta_get_ap_info(&info) != ESP_OK) return 0;
+  return info.rssi;
+}
+
+bool mgos_wifi_dev_start_scan(void) {
+  esp_err_t r = ESP_OK;
+  wifi_mode_t cur_mode = esp32_wifi_get_mode();
+  if (cur_mode != WIFI_MODE_STA && cur_mode != WIFI_MODE_APSTA) {
+    r = mgos_wifi_add_mode(WIFI_MODE_STA);
+    if (r == ESP_OK) r = esp_wifi_start();
+  }
+  if (r == ESP_OK) {
+    wifi_scan_config_t scan_cfg = {.ssid = NULL,
+                                   .bssid = NULL,
+                                   .channel = 0,
+                                   .show_hidden = false,
+                                   .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+                                   .scan_time = {
+                                       .active = {
+                                           .min = 10, .max = 50,
+                                       }, }};
+    r = esp_wifi_scan_start(&scan_cfg, false /* block */);
+  }
+  return (r == ESP_OK);
 }
