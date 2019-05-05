@@ -18,6 +18,9 @@
 bool high = 1;
 bool low  = 0;
 
+#define WIFI_UP_LED				26
+#define WIFI_DOWN_LED			27
+
 #include "esp32_wifi.h"
 #include "mgos_gpio.h"
 
